@@ -48,14 +48,13 @@ class ChipTop(implicit p: Parameters) extends LazyModule with HasTestHarnessFunc
     val implicit_reset = implicitClockSinkNode.in.head._1.reset
 
 
-    // The implicit clock and reset for the system is also, by convention, used for all the IOBinders
-    // TODO: This may not be the right thing to do in all cases
-    withClockAndReset(implicit_clock, implicit_reset) {
-      val (_ports, _iocells, _harnessFunctions) = p(IOBinders).values.flatMap(f => f(lSystem) ++ f(lSystem.module)).unzip3
-      // We ignore _ports for now...
-      iocells ++= _iocells.flatten
-      harnessFunctions ++= _harnessFunctions.flatten
-    }
+    // WARNING: IOBinders don't receive a usable clock/reset
+    // If you are instantiating Chip-top level hardware that require clock/reset,
+    // it might belong in the System instead...
+    val (_ports, _iocells, _harnessFunctions) = p(IOBinders).values.flatMap(f => f(lSystem) ++ f(lSystem.module)).unzip3
+    // We ignore _ports for now...
+    iocells ++= _iocells.flatten
+    harnessFunctions ++= _harnessFunctions.flatten
 
     // Connect the implicit clock/reset, if present
     lSystem.module match { case l: LazyModuleImp => {

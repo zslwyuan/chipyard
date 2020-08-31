@@ -297,9 +297,16 @@ class WithSimSPIFlashModel(rdOnly: Boolean = true) extends OverrideIOBinder({
 class WithSimBlockDevice extends OverrideIOBinder({
   (system: CanHavePeripheryBlockDeviceModuleImp) => system.bdev.map { bdev =>
     val (port, ios) = AddIOCells.blockDev(bdev)
+
+    // Since this should never appear on a real chip, don't bother with IOCells,
+    // and directly punch through the clock/reset
+    val blkdev_clock = IO(Output(Clock()))
+    val blkdev_reset = IO(Output(Reset()))
+    blkdev_clock := system.outer.controller.get.module.clock
+    blkdev_reset := system.outer.controller.get.module.reset
+
     val harnessFn = (th: HasHarnessSignalReferences) => {
-      // TODO: Using harness clock/reset will be incorrect when systemClock =/= harnessClock
-      SimBlockDevice.connect(th.harnessClock, th.harnessReset.asBool, Some(port))(system.p)
+      SimBlockDevice.connect(blkdev_clock, blkdev_reset.asBool, Some(port))(system.p)
       Nil
     }
     Seq((Seq(port), ios, Some(harnessFn)))
@@ -330,13 +337,25 @@ class WithSimAXIMem extends OverrideIOBinder({
   (system: CanHaveMasterAXI4MemPort) => {
     implicit val p: Parameters = GetSystemParameters(system)
     val peiTuples = AddIOCells.axi4(system.mem_axi4, system.memAXI4Node, "mem")
+    val sys = system.asInstanceOf[BaseSubsystem]
+
+    val axi4_clock = IO(Output(Clock())).suggestName("axi4_clock")
+    val axi4_reset = IO(Output(Bool())).suggestName("axi4_reset")
+    // Since this should never appear on a real chip, don't bother with IOCells,
+    // and directly punch through the clock/reset
+    BoringUtils.bore(sys.mbus.module.clock, Seq(axi4_clock))
+    BoringUtils.bore(sys.mbus.module.reset, Seq(axi4_reset))
+
     // TODO: we are inlining the connectMem method of SimAXIMem because
     //   it takes in a dut rather than seq of axi4 ports
     val harnessFn = (th: HasHarnessSignalReferences) => {
       peiTuples.map { case (port, edge, ios) =>
         val mem = LazyModule(new SimAXIMem(edge, size = p(ExtMem).get.master.size))
-        Module(mem.module).suggestName("mem")
+        withClockAndReset(axi4_clock, axi4_reset) {
+          Module(mem.module).suggestName("mem")
+        }
         mem.io_axi4.head <> port
+
       }
       Nil
     }
@@ -349,15 +368,21 @@ class WithBlackBoxSimMem extends OverrideIOBinder({
   (system: CanHaveMasterAXI4MemPort) => {
     implicit val p: Parameters = GetSystemParameters(system)
     val peiTuples = AddIOCells.axi4(system.mem_axi4, system.memAXI4Node, "mem")
+    val sys = system.asInstanceOf[BaseSubsystem]
+    val axi4_clock = IO(Output(Clock())).suggestName("axi4_clock")
+    val axi4_reset = IO(Output(Bool())).suggestName("axi4_reset")
+    // Since this should never appear on a real chip, don't bother with IOCells,
+    // and directly punch through the clock/reset
+    BoringUtils.bore(sys.mbus.module.clock, Seq(axi4_clock))
+    BoringUtils.bore(sys.mbus.module.reset, Seq(axi4_reset))
     val harnessFn = (th: HasHarnessSignalReferences) => {
       peiTuples.map { case (port, edge, ios) =>
         val memSize = p(ExtMem).get.master.size
         val lineSize = p(CacheBlockBytes)
         val mem = Module(new SimDRAM(memSize, lineSize, edge.bundle))
+        mem.io.clock := axi4_clock
+        mem.io.reset := axi4_reset
         mem.io.axi <> port
-        // TODO: Using harness clock/reset will be incorrect when systemClock =/= harnessClock
-        mem.io.clock := th.harnessClock
-        mem.io.reset := th.harnessReset
       }
       Nil
     }
@@ -369,10 +394,21 @@ class WithSimAXIMMIO extends OverrideIOBinder({
   (system: CanHaveMasterAXI4MMIOPort) => {
     implicit val p: Parameters = GetSystemParameters(system)
     val peiTuples = AddIOCells.axi4(system.mmio_axi4, system.mmioAXI4Node, "mmio_mem")
+
+    val sys = system.asInstanceOf[BaseSubsystem]
+    val axi4_clock = IO(Output(Clock())).suggestName("axi4_clock")
+    val axi4_reset = IO(Output(Bool())).suggestName("axi4_reset")
+    // Since this should never appear on a real chip, don't bother with IOCells,
+    // and directly punch through the clock/reset
+    BoringUtils.bore(sys.mbus.module.clock, Seq(axi4_clock))
+    BoringUtils.bore(sys.mbus.module.reset, Seq(axi4_reset))
+
     val harnessFn = (th: HasHarnessSignalReferences) => {
       peiTuples.zipWithIndex.map { case ((port, edge, ios), i) =>
         val mmio_mem = LazyModule(new SimAXIMem(edge, size = 4096))
-        Module(mmio_mem.module).suggestName(s"mmio_mem_${i}")
+        withClockAndReset (axi4_clock, axi4_reset) {
+          Module(mmio_mem.module).suggestName(s"mmio_mem_${i}")
+        }
         mmio_mem.io_axi4.head <> port
       }
       Nil
@@ -408,76 +444,75 @@ class WithTieOffL2FBusAXI extends OverrideIOBinder({
   }
 })
 
-class WithSimDebug extends OverrideIOBinder({
+// TODO we need to rethink what "Tie-off-debug" means. The current system punches out
+// excessive IOs.
+class WithTiedOffDebug extends OverrideIOBinder({
   (system: HasPeripheryDebugModuleImp) => {
-    val (ports, iocells) = AddIOCells.debug(system)(system.p)
+    val (psdPort, resetctrlOpt, debugPortOpt, ioCells) =
+      AddIOCells.debug(system.psd, system.resetctrl, system.debug)(system.p)
     val harnessFn = (th: HasHarnessSignalReferences) => {
-      val dtm_success = Wire(Bool())
-      when (dtm_success) { th.success := true.B }
-      ports.map {
-        case d: ClockedDMIIO =>
-          val dtm = Module(new SimDTM()(system.p)).connect(th.harnessClock, th.harnessReset.asBool, d, dtm_success)
-        case j: JTAGIO =>
-          val jtag = Module(new SimJTAG(tickDelay=3)).connect(j, th.harnessClock, th.harnessReset.asBool, ~(th.harnessReset.asBool), dtm_success)
-        case _ =>
-          require(false, "We only support DMI or JTAG simulated debug connections")
+      Debug.tieoffDebug(debugPortOpt, resetctrlOpt, Some(psdPort))(system.p)
+      // tieoffDebug doesn't actually tie everything off :/
+      debugPortOpt.foreach { d =>
+        d.clockeddmi.foreach({ cdmi => cdmi.dmi.req.bits := DontCare; cdmi.dmiClock := th.harnessClock })
+        d.dmactiveAck := DontCare
+        d.clock := th.harnessClock // TODO fix: This should be driven from within the chip
       }
       Nil
     }
-    Seq((ports, iocells, Some(harnessFn)))
+    Seq((Seq(psdPort) ++ resetctrlOpt ++ debugPortOpt.toSeq, Nil, Some(harnessFn)))
   }
 })
 
-class WithTiedOffDebug extends OverrideIOBinder({
+// TODO we need to rethink what this does. The current system punches out excessive IOs.
+// Some of the debug clock/reset should be driven from on-chip
+class WithSimDebug extends OverrideIOBinder({
   (system: HasPeripheryDebugModuleImp) => {
-    val (ports, iocells) = AddIOCells.debug(system)(system.p)
+    val (psdPort, resetctrlPortOpt, debugPortOpt, ioCells) =
+      AddIOCells.debug(system.psd, system.resetctrl, system.debug)(system.p)
     val harnessFn = (th: HasHarnessSignalReferences) => {
-      ports.map {
-        case d: ClockedDMIIO =>
-          d.dmi.req.valid := false.B
-          d.dmi.req.bits  := DontCare
-          d.dmi.resp.ready := true.B
-          d.dmiClock := th.harnessClock
-          d.dmiReset := th.harnessReset
-        case j: JTAGIO =>
-          j.TCK := true.B.asClock
-          j.TMS := true.B
-          j.TDI := true.B
-          j.TRSTn.foreach { r => r := true.B }
-        case a: ClockedAPBBundle =>
-          a.tieoff()
-          a.clock := false.B.asClock
-          a.reset := true.B.asAsyncReset
-          a.psel := false.B
-          a.penable := false.B
-        case _ => require(false)
-      }
+      val dtm_success = Wire(Bool())
+      Debug.connectDebug(debugPortOpt, resetctrlPortOpt, psdPort, th.harnessClock, th.harnessReset.asBool, dtm_success)(system.p)
+      when (dtm_success) { th.success := true.B }
+      th.dutReset := th.harnessReset.asBool | debugPortOpt.map { debug => AsyncResetReg(debug.ndreset).asBool }.getOrElse(false.B)
       Nil
     }
-    Seq((ports, iocells, Some(harnessFn)))
+    Seq((Seq(psdPort) ++ debugPortOpt.toSeq, ioCells, Some(harnessFn)))
   }
 })
 
 class WithTiedOffSerial extends OverrideIOBinder({
-  (system: CanHavePeripherySerialModuleImp) => system.serial.map({ serial =>
+  (system: CanHavePeripherySerial) => system.serial.map({ serial =>
     val (port, ioCells) = AddIOCells.serial(serial)
+    val sys = system.asInstanceOf[BaseSubsystem]
+    val serial_clock = Wire(Output(Clock())).suggestName("serial_clock_int")
+    serial_clock := false.B.asClock // must be initialized for BoringUtils to work??
+    BoringUtils.bore(sys.fbus.module.clock, Seq(serial_clock))
+    val (serial_clock_io, serial_clock_iocell) = IOCell.generateIOFromSignal(serial_clock, Some("serial_clock"))
+    serial_clock_io.suggestName("serial_clock")
     val harnessFn = (th: HasHarnessSignalReferences) => {
       SerialAdapter.tieoff(port)
       Nil
     }
-    Seq((Seq(port), ioCells, Some(harnessFn)))
+    Seq((Seq(port, serial_clock_io), ioCells ++ serial_clock_iocell, Some(harnessFn)))
   }).getOrElse(Nil)
 })
 
 class WithSimSerial extends OverrideIOBinder({
-  (system: CanHavePeripherySerialModuleImp) => system.serial.map({ serial =>
+  (system: CanHavePeripherySerial) => system.serial.map({ serial =>
     val (port, ioCells) = AddIOCells.serial(serial)
+    val sys = system.asInstanceOf[BaseSubsystem]
+    val serial_clock = Wire(Output(Clock())).suggestName("serial_clock_int")
+    serial_clock := false.B.asClock // must be initialized for BoringUtils to work??
+    BoringUtils.bore(sys.fbus.module.clock, Seq(serial_clock))
+    val (serial_clock_io, serial_clock_iocell) = IOCell.generateIOFromSignal(serial_clock, Some("serial_clock"))
+    serial_clock_io.suggestName("serial_clock")
     val harnessFn = (th: HasHarnessSignalReferences) => {
-      val ser_success = SerialAdapter.connectSimSerial(port, th.harnessClock, th.harnessReset)
+      val ser_success = SerialAdapter.connectSimSerial(port, serial_clock_io, th.harnessReset)
       when (ser_success) { th.success := true.B }
       Nil
     }
-    Seq((Seq(port), ioCells, Some(harnessFn)))
+    Seq((Seq(port, serial_clock_io), ioCells ++ serial_clock_iocell, Some(harnessFn)))
   }).getOrElse(Nil)
 })
 

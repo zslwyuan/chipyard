@@ -6,7 +6,10 @@ import scala.collection.mutable.{ArrayBuffer}
 
 import freechips.rocketchip.config.{Parameters, Field}
 import freechips.rocketchip.diplomacy.{LazyModule}
-import freechips.rocketchip.util.{ResetCatchAndSync}
+import freechips.rocketchip.util.{ResetCatchAndSync, AsyncResetReg}
+import freechips.rocketchip.devices.debug.{HasPeripheryDebugModuleImp}
+
+
 import chipyard.config.ConfigValName._
 import chipyard.iobinders.{IOBinders, TestHarnessFunction, IOBinderTuple}
 
@@ -69,6 +72,10 @@ abstract class BaseChipTop()(implicit val p: Parameters) extends RawModule with 
   // The system module specified by BuildSystem
   val lSystem = p(BuildSystem)(p).suggestName("system")
   val system = withClockAndReset(systemClock, systemReset) { Module(lSystem.module) }
+  
+  system match { case m: HasPeripheryDebugModuleImp =>
+    m.reset := (systemReset.asBool | m.debug.map { debug => AsyncResetReg(debug.ndreset) }.getOrElse(false.B)).asBool
+  }
 
   // Call all of the IOBinders and provide them with a default clock and reset
   withClockAndReset(systemClock, systemReset) {
